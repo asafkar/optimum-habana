@@ -270,10 +270,14 @@ def setup_model(args, model_dtype, model_kwargs, logger):
 
         model = load(model_name_or_path=args.model_name_or_path, format="huggingface", device="hpu", **model_kwargs)
     elif args.local_quantized_inc_model_path:
-        org_model = AutoModelForCausalLM.from_pretrained(
+        if "Qwen" in args.model_name_or_path:
+            from optimum.habana.transformers.models import GaudiQwen2VLForConditionalGeneration
+            org_model =  GaudiQwen2VLForConditionalGeneration.from_pretrained(args.model_name_or_path, **model_kwargs)
+        else:
+            org_model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             **model_kwargs,
-        )
+            )
 
         from neural_compressor.torch.quantization import load
 
@@ -292,9 +296,13 @@ def setup_model(args, model_dtype, model_kwargs, logger):
         if args.peft_model is not None:
             model = peft_model(args, model_dtype, logger, **model_kwargs)
         else:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path, torch_dtype=model_dtype, **model_kwargs
-            )
+            if "Qwen" in args.model_name_or_path:
+                from optimum.habana.transformers.models import GaudiQwen2VLForConditionalGeneration
+                model =  GaudiQwen2VLForConditionalGeneration.from_pretrained(args.model_name_or_path, **model_kwargs)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path, torch_dtype=model_dtype, **model_kwargs
+                )
     if args.quant_config:
         model = setup_quantization(model, args)
 

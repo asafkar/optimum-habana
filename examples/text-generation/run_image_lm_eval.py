@@ -20,6 +20,19 @@
 # lm_eval --model hf-multimodal --model_args pretrained=meta-llama/Llama-3.2-11B-Vision-Instruct,max_images=1,interleave=True,device=hpu,image_string=\<image\> --tasks mmmu_val_health_and_medicine --apply_chat_template --batch_size=1 --gen_kwargs max_new_tokens=128
 # python run_image_lm_eval.py --model_name_or_path meta-llama/Llama-3.2-11B-Vision-Instruct -o bla.txt --tasks mmmu_val_humanities_and_social_science
 
+"""
+Qwen: 
+
+python run_image_lm_eval.py --model_name_or_path Qwen/Qwen2-VL-2B-Instruc -o bla.txt --tasks mmmu_val_humanities_and_social_science
+PYTHONPATH=/home/akarnieli/qnpu/pt/src/optimum-habana:/home/akarnieli/qnpu/pt/src/neural-compressor-fork python run_image_lm_eval.py --model_name_or_path Qwen/Qwen2-VL-2B-Instruct -o /home/akarnieli/models/qwen/qwen2_vl_2b_instruct_w4a16.txt --tasks mmmu_val --local_quantized_inc_model_path /workdisk/tgafni/qwen2_vl_2B_instruct/w4a16/qwen2_vl_2b_instruct_4bits
+
+
+fp8:
+QUANT_CONFIG=/home/akarnieli/models/qwen/maxabs_measure.json PYTHONPATH=/home/akarnieli/qnpu/pt/src/optimum-habana:/home/akarnieli/qnpu/pt/src/neural-compressor-fork python run_image_lm_eval.py --model_name_or_path Qwen/Qwen2-VL-2B-Instruct -o /tmp/bla.txt --tasks mmmu_val --local_quantized_inc_model_path /workdisk/tgafni/qwen2_vl_2B_instruct/w4a8/qwen2_vl_2b_instruct_4bits --limit 2
+QUANT_CONFIG=/home/akarnieli/models/qwen/maxabs_quant.json PYTHONPATH=/home/akarnieli/qnpu/pt/src/optimum-habana:/home/akarnieli/qnpu/pt/src/neural-compressor-fork python run_image_lm_eval.py --model_name_or_path Qwen/Qwen2-VL-2B-Instruct -o /home/akarnieli/models/qwen/qwen2_vl_2b_instruct_w4a8.txt --tasks mmmu_val --local_quantized_inc_model_path /workdisk/tgafni/qwen2_vl_2B_instruct/w4a8/qwen2_vl_2b_instruct_4bits
+
+"""
+
 import argparse
 import json
 import multiprocessing as mp
@@ -47,6 +60,12 @@ from utils import finalize_quantization, initialize_model, save_model
 
 from optimum.habana.utils import get_hpu_memory_stats
 
+ 
+from transformers import AutoModelForCausalLM, Qwen2VLConfig, Qwen2VLForConditionalGeneration
+AutoModelForCausalLM.register(config_class=Qwen2VLConfig, model_class=Qwen2VLForConditionalGeneration)
+
+from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+adapt_transformers_to_gaudi()
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logger = utils.eval_logger
@@ -158,138 +177,8 @@ def setup_lm_eval_parser():
     args = setup_parser(parser)
     return args
 
-
-class HabanaModelAdapter(HFLM):
-    def __init__(
-        self,
-        processor: AutoProcessor,
-        model: AutoModelForCausalLM,
-        args: argparse.Namespace,
-        options: GenerationConfig,
-        backend: Literal["default", "causal", "seq2seq"] = "default",
-        truncation: Optional[bool] = False,
-        logits_cache: bool = True,
-        add_bos_token: Optional[bool] = False,
-        delta: Optional[str] = None,
-        **kwargs,
-    ) -> None:
-        # To skip cuda code of the HFLM init
-        TemplateLM.__init__(self)
-        self.processor = processor
-        self._model = model
-        self._config = self._model.config
-        self._batch_size = args.batch_size
-        self.buckets: list[int] = sorted(args.buckets)
-        self.options = options
-        self.device_ = args.device
-        self.pretrained = model
-        self.peft = args.peft_model
-        self.delta = delta
-        # determine which of 'causal' and 'seq2seq' backends to use for HF models
-        self._get_backend(config=self._config, backend=backend, trust_remote_code=args.trust_remote_code)
-        self.truncation = truncation
-        self.logits_cache = logits_cache
-        self.add_bos_token = add_bos_token
-        self.vocab_size = self._model.config.text_config.vocab_size
-        # import pdb; pdb.set_trace()
-        if "gemma" in getattr(self._config, "model_type", ""):
-            self.add_bos_token = True
-            logger.info(
-                f"Model type is '{self._config.model_type}', part of the Gemma family--a BOS token will be used as Gemma underperforms without it."
-            )
-
-        self.batch_size_per_gpu = int(args.batch_size)
-        self.revision = args.model_revision
-        self.model_inputs = {"use_cache": self.options.use_cache}
-        if self._model.config.model_type in [
-            "llama",
-            "mistral",
-            "falcon",
-            "phi",
-            "mixtral",
-            "qwen2",
-            "gptj",
-            "starcoder2",
-            "gemma",
-            "baichuan",
-        ]:
-            self.model_inputs.update(
-                {
-                    "reuse_cache": self.options.reuse_cache,
-                }
-            )
-
-        if self.model.config.model_type in [
-            "llama",
-            "mistral",
-            "qwen2",
-            "falcon",
-            "starcoder2",
-            "gemma",
-            "baichuan",
-            "gpt_bigcode",
-        ]:
-            if self.model.config.model_type not in ["falcon", "gpt_bigcode"]:
-                self.model_inputs.update(
-                    {
-                        "attn_softmax_bf16": self.options.attn_softmax_bf16,
-                    }
-                )
-            self.model_inputs.update(
-                {
-                    "use_flash_attention": self.options.use_flash_attention,
-                    "flash_attention_recompute": self.options.flash_attention_recompute,
-                    "flash_attention_causal_mask": self.options.flash_attention_causal_mask,
-                }
-            )
-            if self.model.config.model_type in ["llama", "qwen2", "baichuan", "gpt_bigcode"]:
-                self.model_inputs.update({"flash_attention_fast_softmax": self.options.flash_attention_fast_softmax})
-        if args.warmup:
-            self.warm_up()
-
-    def warm_up(self) -> None:
-        for bucket_size in reversed(self.buckets):
-            inps = torch.ones((self._batch_size, bucket_size), dtype=torch.int64)
-            self._model_call(inps)
-
-    @property
-    def eot_token_id(self) -> int:
-        return self._model.config.eos_token_id
-
-    @property
-    def max_length(self) -> int:
-        return self.buckets[-1]
-
-    @property
-    def device(self):
-        # We need to do padding ourselves, otherwise we'll end up with recompilations
-        # Returning 'cpu' to keep tensors on CPU in lm_eval code
-        return "cpu"
-
-    def find_bucket(self, length: int) -> list[int]:
-        return [b for b in self.buckets if b >= length][0]
-
-    def _model_call(self, inps: torch.Tensor) -> torch.Tensor:
-        bs, seq_length = inps.shape
-        padding_length = 0
-        if self.options.static_shapes:
-            bucket_length = self.find_bucket(seq_length)
-            if self.options.use_cache and self.options.reuse_cache:
-                self._model.allocate_kv_cache(bs, bucket_length + 1, bucket_length)
-            padding_length = bucket_length - seq_length
-            inps = F.pad(inps, (0, padding_length), value=self._model.config.pad_token_id)
-        logits = self._model(inps.to(self.device_), **self.model_inputs)["logits"].cpu()
-
-        if self.options.static_shapes and padding_length > 0:
-            logits = logits[:, :-padding_length, :]
-        logits = logits.to(torch.float32)
-        return logits
-
-    def _model_generate(self, context, max_length, stop, **generation_kwargs):
-        # temperature = 0.0 if not set
-        # if do_sample is false and temp==0.0:
-        # remove temperature, as do_sample=False takes care of this
-        # and we don't want a warning from HF
+class HabanaHFMultimodalLM(HFMultimodalLM):
+    def _model_multimodal_generate(self, inputs, max_length, stop, **generation_kwargs):
         generation_kwargs["temperature"] = generation_kwargs.get("temperature", 0.0)
         do_sample = generation_kwargs.get("do_sample", None)
 
@@ -299,17 +188,28 @@ class HabanaModelAdapter(HFLM):
 
         if do_sample is False and generation_kwargs.get("temperature") == 0.0:
             generation_kwargs.pop("temperature")
-        # build stopping criteria
-        stopping_criteria = stop_sequences_criteria(self.processor, stop, context.shape[1], context.shape[0])
-        # move context & attention_mask to hpu
-        context = context.to("hpu")
-        generation_kwargs["attention_mask"] = generation_kwargs["attention_mask"].to("hpu")
+
+        stopping_criteria = stop_sequences_criteria(
+            self.tokenizer,
+            stop,
+            inputs["input_ids"].shape[1],
+            inputs["input_ids"].shape[0],
+        )
+        # import ptvsd
+        # ptvsd.enable_attach(address=('127.0.0.1', 5678))
+        # ptvsd.wait_for_attach()
+        # import debugpy
+        # debugpy.listen(("localhost", 5678))
+        # print("WAIT FOR DEBUGPY")
+        # debugpy.wait_for_client()
+        # debugpy.breakpoint()
+        
         return self.model.generate(
-            input_ids=context,
+            **inputs,
             max_length=max_length,
             stopping_criteria=stopping_criteria,
-            pad_token_id=self.processor.pad_token_id,
-            use_cache=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            # use_cache=True, #FIXME ?
             **generation_kwargs,
         )
 
@@ -385,9 +285,10 @@ def main() -> None:
                 )
 
         # model, _, tokenizer, generation_config = initialize_model(args, logger)
-        _, _, _, generation_config = initialize_model(args, logger)
-    assistant_model = None
-    model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        model, _, _, generation_config = initialize_model(args, logger)
+        # model.config.use_cache = True
+        # processor = AutoProcessor.from_pretrained(model_id)
+        lm = HabanaHFMultimodalLM(pretrained=model)
 
     if args.trust_remote_code:
         # trust_remote_code fix was introduced in lm_eval 0.4.3
@@ -397,41 +298,27 @@ def main() -> None:
     evaluation_tracker_args = {}
     evaluation_tracker = EvaluationTracker(**evaluation_tracker_args)
 
-    with torch.no_grad():
-        model = (
-            MllamaForConditionalGeneration.from_pretrained(
-                model_id,
-                torch_dtype=torch.bfloat16,
-                _attn_implementation='eager',
-                # use_cache=False
-            )
-            .eval()
-            .to(args.device)
-        )
-        model.config.use_cache = False
-        processor = AutoProcessor.from_pretrained(model_id)
-        # lm = HabanaModelAdapter(processor, model, args, generation_config)
-        lm = HFMultimodalLM(pretrained=model)
+    # # Regroup part of generation_config as gen_kwargs, defined as "String arguments for model generation on greedy_until tasks, e.g. `temperature=0,top_k=0,top_p=0`."
+    # if generation_config.do_sample is True:
+    #     gen_kwargs = f"temperature={generation_config.temperature}"
+    #     if generation_config.top_k is not None:
+    #         gen_kwargs += f",top_k={generation_config.top_k}"
+    #     gen_kwargs += f",do_sample={generation_config.do_sample}"
+    #     gen_kwargs += f",top_p={generation_config.top_p}"
+    # else:
+    #     gen_kwargs = None
 
-    # Regroup part of generation_config as gen_kwargs, defined as "String arguments for model generation on greedy_until tasks, e.g. `temperature=0,top_k=0,top_p=0`."
-    if generation_config.do_sample is True:
-        gen_kwargs = f"temperature={generation_config.temperature}"
-        if generation_config.top_k is not None:
-            gen_kwargs += f",top_k={generation_config.top_k}"
-        gen_kwargs += f",do_sample={generation_config.do_sample}"
-        gen_kwargs += f",top_p={generation_config.top_p}"
-    else:
-        gen_kwargs = None
+     # needed for VL with HPU
+    gen_kwargs="static_shapes=True,max_gen_toks=128,lazy_mode=True,use_cache=True,cache_implementation=static,use_flash_attention=True"
+
+
     eval_start = time.perf_counter()
 
     with torch.no_grad():
         results = evaluator.simple_evaluate(
             lm,
             model_args="max_images=1,interleave=True,image_string=<|image|>",
-            # model_args="max_images=1,interleave=True,image_string=<|image|>,pretrained=meta-llama/Llama-3.2-11B-Vision-Instruct",
-            # model="hf-multimodal",
-            gen_kwargs="static_shapes=False", #max_new_tokens=128,
-            # gen_kwargs=gen_kwargs,
+            gen_kwargs=gen_kwargs,
             tasks=task_names,
             num_fewshot=args.num_fewshot,
             batch_size=args.batch_size,
